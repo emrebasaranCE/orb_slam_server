@@ -1,0 +1,57 @@
+%YAML:1.0
+
+#--------------------------------------------------------------------------------------------
+# Camera Parameters. Auto-generated from cameraParameters
+#--------------------------------------------------------------------------------------------
+File.version: "1.0"
+
+Camera.type: "PinHole"
+
+# Intrinsic Parameters
+Camera1.fx: 1413.3
+Camera1.fy: 1418.8
+Camera1.cx: 950.0639
+Camera1.cy: 543.3796
+
+# Distortion Coefficients
+Camera1.k1: -0.0091
+Camera1.k2: 0.0666
+Camera1.k3: 0.0
+Camera1.p1: 0.0
+Camera1.p2: 0.0
+
+
+# Image Resolution
+Camera.width: 1920
+Camera.height: 1080
+
+# Frames per second
+Camera.fps: 30
+
+# Color format
+Camera.RGB: 1
+
+ORBextractor.nFeatures: 1200
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+Viewer.imageViewScale: 0.0
+
+Viewer.KeyFrameSize: 0.0
+Viewer.KeyFrameLineWidth: 0.05
+Viewer.GraphLineWidth: 0.05
+Viewer.PointSize: 0.0
+Viewer.CameraSize: 0.05
+Viewer.CameraLineWidth: 0.05
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: 0.0
+Viewer.ViewpointZ: 0.0
+Viewer.ViewpointF: 0.0
+
+# Camera.newHeight: 1920
+# Camera.newWidth: 1080
+# System.LoadAtlasFromFile: "test"
+# System.SaveAtlasToFile: "test"
+# System.thFarPoints: 0.0
