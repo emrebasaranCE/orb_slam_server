@@ -1,2 +1,7 @@
+# Ignore everything inside these folders
 /slam_data/*
 /slam_results/*
+
+# But do not ignore the folders themselves
+!/slam_data/.gitkeep
+!/slam_results/.gitkeep
