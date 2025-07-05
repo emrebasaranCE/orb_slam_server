@@ -12,4 +12,4 @@ Gerekli Fonksiyonlar:
 
 --- 
 
-local trajectory islemini, globale cevirmem lazim. Bunu da
+local trajectory islemini, globale cevirmem lazim. Bunu da islenicek frameden once olan frame'i bir kez orb_slam den gecirerek local degerini bulup, buradan da bulmak istedigim frame'in  trajectory degerini bulabiliriz.
