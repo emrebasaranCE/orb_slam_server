@@ -36,49 +36,39 @@ class ORBSLAMProcessor:
             Path(dir_path).mkdir(parents=True, exist_ok=True)
     
     def create_euroc_structure(self, session_id, frames):
-        """Create EuRoC dataset structure for ORB-SLAM3 with image format conversion"""
         session_dir = Path(CONFIG['working_dir']) / session_id
         data_dir = session_dir / 'mav0' / 'cam0' / 'data'
         data_dir.mkdir(parents=True, exist_ok=True)
         
         frame_names = []
         
-        # Copy/convert frames to EuRoC structure keeping original frame names but ensuring PNG format
         for frame_data in frames:
             if 'image_path' in frame_data:
-                # Extract original filename from the path
                 original_path = Path(frame_data['image_path'])
-                
-                # Change extension to .png while keeping the base name
                 frame_filename = original_path.stem + '.png'
                 frame_path = data_dir / frame_filename
                 frame_names.append(frame_filename)
-                
-                # Convert and save the frame as PNG
-                self.convert_image_to_png(frame_data['image_path'], frame_path)
+
+                # If it's already a PNG, just copy it; otherwise convert
+                if original_path.suffix.lower() == '.png':
+                    shutil.copy2(str(original_path), str(frame_path))
+                else:
+                    self.convert_image_to_png(str(original_path), frame_path)
                 
             elif 'image_data' in frame_data:
-                # If image data is provided, we need a filename
                 original_filename = frame_data.get('filename', f"frame_{len(frame_names):06d}")
-                
-                # Ensure PNG extension
                 if not original_filename.lower().endswith('.png'):
-                    base_name = Path(original_filename).stem
-                    frame_filename = base_name + '.png'
+                    frame_filename = Path(original_filename).stem + '.png'
                 else:
                     frame_filename = original_filename
-                    
                 frame_path = data_dir / frame_filename
                 frame_names.append(frame_filename)
-                
-                # Save the image data as PNG
                 self.save_frame_as_png(frame_data['image_data'], frame_path)
         
-        # Create timestamps file (just filenames without extension, one per line)
         timestamps_path = session_dir / 'mav0' / 'cam0' / 'data.csv'
         with open(timestamps_path, 'w') as f:
-            for frame_name in frame_names:
-                f.write(f"{Path(frame_name).stem}\n")
+            for name in frame_names:
+                f.write(f"{Path(name).stem}\n")
         
         return str(session_dir), str(timestamps_path)
 
@@ -136,20 +126,6 @@ class ORBSLAMProcessor:
             print(f"Error saving image data as PNG: {e}")
             raise
         
-    def save_frame(self, image_data, output_path):
-        """Save frame data to file"""
-        if isinstance(image_data, str):
-            # Assume base64 encoded image
-            import base64
-            image_bytes = base64.b64decode(image_data)
-            with open(output_path, 'wb') as f:
-                f.write(image_bytes)
-        elif isinstance(image_data, np.ndarray):
-            # Numpy array
-            cv2.imwrite(str(output_path), image_data)
-        else:
-            raise ValueError("Unsupported image data format")
-    
     def run_orb_slam(self, frames_path, timestamps_path):
         """Execute ORB-SLAM3 processing"""
         try:
@@ -277,139 +253,6 @@ class ORBSLAMProcessor:
         results['translation'] = [(p['tx'], p['ty'], p['tz']) for p in trajectory]
         
         return results
-    
-    def calculate_global_local_delta(self, global_trajectory, local_trajectory, frame_index):
-        """
-        Calculate the change between global trajectory position and local trajectory position
-        for a specific frame.
-        
-        Args:
-            global_trajectory: Full trajectory from initial 450 frames
-            local_trajectory: Local trajectory from recent slice processing
-            frame_index: The frame index in the global trajectory
-        
-        Returns:
-            Dict containing the delta information
-        """
-        if not global_trajectory or not local_trajectory:
-            return None
-            
-        # Get global pose at frame_index
-        if frame_index >= len(global_trajectory):
-            return None
-            
-        global_pose = global_trajectory[frame_index]
-        
-        # Get the last pose from local trajectory (most recent processed frame)
-        local_pose = local_trajectory[-1]
-        
-        # Calculate translation delta (difference between global and local positions)
-        translation_delta = {
-            'dx': global_pose['tx'] - local_pose['tx'],
-            'dy': global_pose['ty'] - local_pose['ty'],
-            'dz': global_pose['tz'] - local_pose['tz']
-        }
-        
-        # Calculate distance difference
-        distance_delta = np.sqrt(
-            translation_delta['dx']**2 + 
-            translation_delta['dy']**2 + 
-            translation_delta['dz']**2
-        )
-        
-        # Calculate rotation delta (quaternion difference)
-        rotation_delta = {
-            'dqx': global_pose['qx'] - local_pose['qx'],
-            'dqy': global_pose['qy'] - local_pose['qy'],
-            'dqz': global_pose['qz'] - local_pose['qz'],
-            'dqw': global_pose['qw'] - local_pose['qw']
-        }
-        
-        # Calculate rotation angle difference
-        dot_product = (
-            global_pose['qx'] * local_pose['qx'] +
-            global_pose['qy'] * local_pose['qy'] +
-            global_pose['qz'] * local_pose['qz'] +
-            global_pose['qw'] * local_pose['qw']
-        )
-        
-        # Clamp dot product to avoid numerical errors
-        dot_product = np.clip(abs(dot_product), 0.0, 1.0)
-        rotation_angle_delta = 2 * np.arccos(dot_product)
-        
-        return {
-            'translation_delta': translation_delta,
-            'rotation_delta': rotation_delta,
-            'distance_delta': distance_delta,
-            'rotation_angle_delta': rotation_angle_delta,
-            'global_pose': {
-                'position': [global_pose['tx'], global_pose['ty'], global_pose['tz']],
-                'rotation': [global_pose['qx'], global_pose['qy'], global_pose['qz'], global_pose['qw']]
-            },
-            'local_pose': {
-                'position': [local_pose['tx'], local_pose['ty'], local_pose['tz']],
-                'rotation': [local_pose['qx'], local_pose['qy'], local_pose['qz'], local_pose['qw']]
-            },
-            'frame_index': frame_index
-        }
-    
-    def calculate_frame_delta(self, current_results, previous_results):
-        """Calculate the change between current and previous frame"""
-        if not current_results['trajectory'] or not previous_results['trajectory']:
-            return None
-        
-        # Get the last pose from each trajectory
-        current_pose = current_results['trajectory'][-1]
-        previous_pose = previous_results['trajectory'][-1]
-        
-        # Calculate translation delta
-        translation_delta = {
-            'dx': current_pose['tx'] - previous_pose['tx'],
-            'dy': current_pose['ty'] - previous_pose['ty'],
-            'dz': current_pose['tz'] - previous_pose['tz']
-        }
-        
-        # Calculate distance moved
-        distance_moved = np.sqrt(
-            translation_delta['dx']**2 + 
-            translation_delta['dy']**2 + 
-            translation_delta['dz']**2
-        )
-        
-        # Calculate rotation delta (quaternion difference)
-        rotation_delta = {
-            'dqx': current_pose['qx'] - previous_pose['qx'],
-            'dqy': current_pose['qy'] - previous_pose['qy'],
-            'dqz': current_pose['qz'] - previous_pose['qz'],
-            'dqw': current_pose['qw'] - previous_pose['qw']
-        }
-        
-        # Calculate rotation magnitude (angle between quaternions)
-        dot_product = (
-            previous_pose['qx'] * current_pose['qx'] +
-            previous_pose['qy'] * current_pose['qy'] +
-            previous_pose['qz'] * current_pose['qz'] +
-            previous_pose['qw'] * current_pose['qw']
-        )
-        
-        # Clamp dot product to avoid numerical errors
-        dot_product = np.clip(abs(dot_product), 0.0, 1.0)
-        rotation_angle = 2 * np.arccos(dot_product)
-        
-        return {
-            'translation_delta': translation_delta,
-            'rotation_delta': rotation_delta,
-            'distance_moved': distance_moved,
-            'rotation_angle': rotation_angle,
-            'current_pose': {
-                'position': [current_pose['tx'], current_pose['ty'], current_pose['tz']],
-                'rotation': [current_pose['qx'], current_pose['qy'], current_pose['qz'], current_pose['qw']]
-            },
-            'previous_pose': {
-                'position': [previous_pose['tx'], previous_pose['ty'], previous_pose['tz']],
-                'rotation': [previous_pose['qx'], previous_pose['qy'], previous_pose['qz'], previous_pose['qw']]
-            }
-        }
     
     def save_results(self, session_id, results):
         """Save processing results to file"""
@@ -761,22 +604,7 @@ def process_single_frame():
         
         # Parse results
         results = processor.parse_slam_results(new_session_id)
-        
-        # Calculate frame delta if we have previous results
-        frame_delta = None
-        if session_id and session_id in processor.processed_results:
-            previous_results = processor.processed_results[session_id]
-            frame_delta = processor.calculate_frame_delta(results, previous_results)
-        
-        # Calculate global-local delta if we have global trajectory
-        global_local_delta = None
-        if session_id and session_id in processor.global_trajectories:
-            global_trajectory = processor.global_trajectories[session_id]
-            local_trajectory = results['trajectory']
-            global_local_delta = processor.calculate_global_local_delta(
-                global_trajectory, local_trajectory, frame_index
-            )
-        
+             
         # Save results
         results_file = processor.save_results(new_session_id, results)
         
@@ -793,14 +621,6 @@ def process_single_frame():
             'results_file': results_file,
             'success': True
         }
-        
-        # Add frame delta information if available
-        if frame_delta:
-            response_data['frame_delta'] = frame_delta
-        
-        # Add global-local delta information if available
-        if global_local_delta:
-            response_data['global_local_delta'] = global_local_delta
         
         return jsonify(response_data)
         
@@ -938,9 +758,9 @@ if __name__ == '__main__':
     print("Available endpoints:")
     print("  GET  /server_health - Server health check")
     print("  GET  /orb_slam3_health - ORB_SLAM3 health check")
+    print("  GET  /list_sessions - List all sessions")
+    print("  GET  /get_results/<session_id> - Get results for session")
     print("  POST /process_initial - Process first 450 frames")
     print("  POST /process_frame - Process specific frame with history")
-    print("  GET  /get_results/<session_id> - Get results for session")
-    print("  GET  /list_sessions - List all sessions")
     print("  POST /calculate_vehicle_position - Calculate vehicle's global position")
     app.run(host='0.0.0.0', port=CONFIG['port'], debug=True)
