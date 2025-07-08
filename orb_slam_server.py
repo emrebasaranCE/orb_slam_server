@@ -15,9 +15,9 @@ app = Flask(__name__)
 CONFIG = {
     'port': 5000,
     # 'orb_slam_path': '../../ORB_SLAM3',  # Update this path
-    'vocabulary_path': '../../ORB_SLAM3/Vocabulary/ORBvoc.txt',  # Relative to current directory
-    'config_path': 'camera_conf_for_concurrent.yml',      # Relative to current directory
-    'executable_path': '../../ORB_SLAM3/Examples/Monocular/mono_euroc',             # Executable name in current directory
+    'vocabulary_path': '../ORB_SLAM3/Vocabulary/ORBvoc.txt',  # Relative to current directory
+    'config_path': 'camera_calibration_2025.yml',      # Relative to current directory
+    'executable_path': '../ORB_SLAM3/Examples/Monocular/mono_euroc',             # Executable name in current directory
     'working_dir': './slam_data',
     'results_dir': './slam_results',
     'test_images_dir': './test_images' # New: Directory for test images
@@ -56,14 +56,25 @@ class ORBSLAMProcessor:
                     self.convert_image_to_png(str(original_path), frame_path)
                 
             elif 'image_data' in frame_data:
-                original_filename = frame_data.get('filename', f"frame_{len(frame_names):06d}")
-                if not original_filename.lower().endswith('.png'):
-                    frame_filename = Path(original_filename).stem + '.png'
-                else:
-                    frame_filename = original_filename
+                # 1) Decide on a .png filename
+                original_filename = frame_data.get(
+                    'filename',
+                    f"frame_{len(frame_names):06d}"
+                )
+                stem = Path(original_filename).stem
+                frame_filename = f"{stem}.png"
                 frame_path = data_dir / frame_filename
                 frame_names.append(frame_filename)
-                self.save_frame_as_png(frame_data['image_data'], frame_path)
+
+                # 2) If image_data is actually a filesystem path (e.g. .webp), convert it
+                img_data = frame_data['image_data']
+                if isinstance(img_data, str) and Path(img_data).suffix.lower() != '.png' and Path(img_data).exists():
+                    # e.g. "/…/frame_000992.webp"
+                    self.convert_image_to_png(img_data, frame_path)
+                else:
+                    # base64 or numpy array → save directly as PNG
+                    self.save_frame_as_png(img_data, frame_path)
+
         
         timestamps_path = session_dir / 'mav0' / 'cam0' / 'data.csv'
         with open(timestamps_path, 'w') as f:
@@ -194,6 +205,23 @@ class ORBSLAMProcessor:
         
         return results
     
+    def copy_slam_results(self, destination_file_name):
+        # Look for common ORB-SLAM3 output files
+        trajectory_files = [
+            'CameraTrajectory.txt',
+            # 'KeyFrameTrajectory.txt',
+            # 'FrameTrajectory.txt'
+        ]
+        
+        for traj_file in trajectory_files:
+            # traj_path = session_dir / traj_file
+            if os.path.exists(traj_file):
+                shutil.copy(traj_file, destination_file_name)
+                os.remove(traj_file)  # Clean up after copying
+                if os.path.exists("KeyFrameTrajectory.txt"):
+                    os.remove("KeyFrameTrajectory.txt")  # Clean up keyframe trajectory if exists
+                break
+    
     def parse_trajectory_file(self, file_path):
         """Parse trajectory file from ORB-SLAM3, returning only the last valid pose."""
         last_pose = None
@@ -280,6 +308,97 @@ class ORBSLAMProcessor:
             return [self.make_json_serializable(item) for item in obj]
         else:
             return obj
+    def calculate_and_save_initial_transform(
+        self,
+        session_id: str,
+        initial_frames: list,
+        local_trans_file: str,
+        gt_file_path: str
+    ) -> dict:
+        """
+        1. Load SLAM-local poses (timestamp, tx, ty, tz, qx, qy, qz, qw).
+        2. Load your ground-truth map from a JSON: { filename: {translation_x, y, z}, … }.
+        3. Build a matched list of GT points in the same order as initial_frames.
+        4. Truncate both clouds to the minimum common length.
+        5. Compute centroids and center both sets.
+        6. Compute optimal scale and rotation (SVD-based Procrustes).
+        7. Save `scale` and 3×3 `rotation` into your results directory.
+        8. Return a dict with the numbers used.
+        """
+
+        # ——— 1) Load SLAM poses ———
+        # Each line: timestamp tx ty tz qx qy qz qw
+        slam_arr = np.loadtxt(local_trans_file)
+        slam_pts = slam_arr[:, 1:4]  # only the (tx, ty, tz) columns
+
+        # ——— 2) Load GT translations from JSON ———
+        with open(gt_file_path, 'r') as f:
+            gt_dict = json.load(f)
+        # Build GT point cloud in the SAME ORDER as your initial_frames
+        gt_pts = []
+        for frame in initial_frames:
+            # frame is a dict with "image_path": "/…/frame_XXXXX.jpg"
+            fname = os.path.basename(frame['image_path'])
+            if fname not in gt_dict:
+                raise KeyError(f"Ground truth missing for {fname}")
+            g = gt_dict[fname]
+            gt_pts.append([g['translation_x'], g['translation_y'], g['translation_z']])
+        gt_pts = np.array(gt_pts, dtype=float)
+
+        # ——— 3) Truncate to the smallest length ———
+        n_slam = slam_pts.shape[0]
+        n_gt   = gt_pts.shape[0]
+        n = min(n_slam, n_gt)
+        if n == 0:
+            raise ValueError("No overlapping points between SLAM and GT")
+        slam_pts = slam_pts[:n]
+        gt_pts   = gt_pts[:n]
+
+        # ——— 4) Compute centroids & subtract ———
+        c_slam = slam_pts.mean(axis=0)
+        c_gt   = gt_pts.mean(axis=0)
+        slam_centered = slam_pts - c_slam
+        gt_centered   = gt_pts   - c_gt
+
+        # ——— 5) Compute scale factor ———
+        # scale = sqrt( sum||gt_centered||² / sum||slam_centered||² )
+        num = np.sum(gt_centered**2)
+        den = np.sum(slam_centered**2)
+        scale = float(np.sqrt(num / den))
+
+        # ——— 6) Scale the SLAM cloud ———
+        slam_scaled = slam_centered * scale
+
+        # ——— 7) Compute optimal rotation via SVD ———
+        H = slam_scaled.T @ gt_centered
+        U, _, Vt = np.linalg.svd(H)
+        R_opt = Vt.T @ U.T
+        # Fix reflection if needed
+        if np.linalg.det(R_opt) < 0:
+            Vt[-1, :] *= -1
+            R_opt = Vt.T @ U.T
+
+        # ——— 8) Persist scale and rotation ———
+        out_dir = Path(CONFIG['results_dir'])
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        scale_path = out_dir / f"{session_id}_scale.txt"
+        rot_path   = out_dir / f"{session_id}_rotation.txt"
+
+        # One line: the scale
+        with open(scale_path, 'w') as f:
+            f.write(f"{scale:.9f}\n")
+
+        # 3×3 matrix, one row per line
+        np.savetxt(rot_path, R_opt, fmt="%.9f")
+
+        # ——— 9) Return values ———
+        return {
+            'scale': scale,
+            'rotation': R_opt.tolist(),
+            'used_points': n
+        }
+    
     def calculate_global_translation(self, prev_global_translation, prev_local_translation, new_local_translation, session_id):
         """
         Calculate global translation for a new frame based on previous global/local translations
@@ -407,8 +526,9 @@ def orb_slam3_health_check():
     # Collect test images
     test_frames = []
     # Sort the images to maintain a consistent order for processing
-    for img_file in sorted(test_images_dir.glob("*.png")):
-        test_frames.append({'image_path': str(img_file)})
+    for img_path in sorted(test_images_dir.iterdir()):
+        if img_path.is_file():
+            test_frames.append({ 'image_path': str(img_path) })
 
     if not test_frames:
         return jsonify({
@@ -419,7 +539,7 @@ def orb_slam3_health_check():
 
     # Use a subset of images for a quick health check
     # We only need a few frames to see if ORB-SLAM3 can process them
-    frames_for_test = test_frames[:10] 
+    frames_for_test = test_frames[:15] 
 
     try:
         start_time = time.time()
@@ -483,17 +603,11 @@ def process_initial_frames():
             return jsonify({'error': 'No frames data provided'}), 400
         
         frames = data['frames']
+        gt_file_path = data['gt_file_path']
         session_name = data.get('session_name', 'default')  # Get session name from request
         
-        if len(frames) >= 450:
-            # Limit to first 450 frames
-            frames = frames[:450]
-        # If less than 450 frames, use all available frames
-        else: 
-            frames = frames[:len(frames)]
-
-        if len(frames) == 0:
-            return jsonify({'error': 'No frames to process'}), 400
+        if not len(frames) > 10:
+            return jsonify({'error': 'Not enough frames to process'}), 400
         
         # Generate session ID with user-provided name
         session_id = f"{session_name}_initial_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -510,29 +624,18 @@ def process_initial_frames():
                 'details': output
             }), 500
         
-        # Parse results
-        results = processor.parse_slam_results(session_id)
+        camera_trajectory_file_name = "{session_name}_local_translations.txt"
+
+        processor.copy_slam_results(destination_file_name=camera_trajectory_file_name)
         
-        # Save results
-        results_file = processor.save_results(session_name, results)
-        
-        # Store frames for potential future processing
-        processor.frames_buffer[session_id] = frames
-        processor.processed_results[session_id] = results
-        
-        # Store global trajectory for future comparisons
-        processor.global_trajectories[session_id] = results['trajectory']
-        
-        return jsonify({
-            'session_id': session_id,
-            'processed_frames': len(frames),
-            'scale': results['scale'],
-            'rotation': results['rotation'],
-            'translation': results['translation'],
-            'results_file': results_file,
-            'success': True
-        })
-        
+        results = processor.calculate_and_save_initial_transform(
+            session_id=session_id,
+            initial_frames=frames,
+            local_trans_file=camera_trajectory_file_name,
+            gt_file_path=gt_file_path
+        )
+        return jsonify('SUCCESS! Scale and Rotation created.')
+    
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -545,20 +648,13 @@ def process_single_frame():
         if not data:
             return jsonify({'error': 'No data provided'}), 400
         
-        frame_index = data.get('frame_index')
-        new_frame = data.get('frame_data')
-        session_name = data.get('session_name', 'default')
+        new_frame = data.get('new_frame_data')
+        new_frame_name = data.get('new_frame_name')
+        previous_frames = data.get('previous_frames', [])
+        # session_name = data.get('session_name', 'default')
         
         # NEW: Accept previous frames directly in the request
-        previous_frames = data.get('previous_frames', [])
-        
-        # Optional: Still support legacy session_id lookup as fallback
-        session_id = data.get('session_id')
-        slice_count = data.get('slice_count', None)
-        
-        if frame_index is None:
-            return jsonify({'error': 'frame_index not provided'}), 400
-        
+                
         # Get frames for processing
         frames_to_process = []
         
@@ -566,29 +662,16 @@ def process_single_frame():
         if previous_frames:
             frames_to_process = previous_frames.copy()
         
-        # Priority 2: Fallback to session_id lookup (legacy support)
-        elif session_id and session_id in processor.frames_buffer:
-            existing_frames = processor.frames_buffer[session_id]
-            
-            if slice_count is not None:
-                # Slice backwards by slice_count from frame_index
-                start_index = max(0, frame_index - slice_count + 1)
-                frames_to_process = existing_frames[start_index:frame_index + 1]
-            else:
-                # Use all frames up to frame_index
-                frames_to_process = existing_frames[:frame_index + 1]
-        
         # Add new frame if provided
         if new_frame:
             frames_to_process.append(new_frame)
         
         if not frames_to_process:
             return jsonify({'error': 'No frames available for processing. Provide previous_frames in request or valid session_id'}), 400
-        
+
         # Generate new session ID for this processing
-        slice_info = f"_slice{slice_count}" if slice_count is not None else ""
         frames_info = f"_provided{len(previous_frames)}" if previous_frames else ""
-        new_session_id = f"{session_name}_frame_{frame_index}{slice_info}{frames_info}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        new_session_id = f"{new_frame_name}{frames_info}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         # Create EuRoC structure
         frames_path, timestamps_path = processor.create_euroc_structure(new_session_id, frames_to_process)
@@ -611,8 +694,6 @@ def process_single_frame():
         # Prepare response
         response_data = {
             'session_id': new_session_id,
-            'frame_index': frame_index,
-            'slice_count': slice_count,
             'processed_frames': len(frames_to_process),
             'frames_source': 'provided' if previous_frames else 'session_lookup',
             'scale': results['scale'],
@@ -678,77 +759,72 @@ def list_sessions():
     return jsonify({'sessions': sessions})
 @app.route('/calculate_vehicle_position', methods=['POST'])
 def calculate_vehicle_position():
-    """
-    Calculate vehicle's global position based on previous global/local translations
-    and new local translation using initial processing transformation parameters.
-    """
     try:
         data = request.get_json()
-        
         if not data:
             return jsonify({'error': 'No data provided'}), 400
-        
-        # Extract required parameters
-        prev_global_translation = data.get('prev_global_translation')
-        prev_local_translation = data.get('prev_local_translation')
-        new_local_translation = data.get('new_local_translation')
-        session_id = data.get('session_id')
-        
-        # Validate required parameters
-        if prev_global_translation is None:
-            return jsonify({'error': 'prev_global_translation not provided'}), 400
-        
-        if prev_local_translation is None:
-            return jsonify({'error': 'prev_local_translation not provided'}), 400
-        
-        if new_local_translation is None:
-            return jsonify({'error': 'new_local_translation not provided'}), 400
-        
-        if session_id is None:
-            return jsonify({'error': 'session_id not provided'}), 400
-        
-        # Validate translation data format
-        for translation_data, name in [
-            (prev_global_translation, 'prev_global_translation'),
-            (prev_local_translation, 'prev_local_translation'),
-            (new_local_translation, 'new_local_translation')
+
+        prev_global = data.get('prev_global_translation')
+        prev_local  = data.get('prev_local_translation')
+        new_local   = data.get('new_local_translation')
+        session_id  = data.get('session_name')
+
+        # --- Validate ---
+        for name, arr in [
+            ('prev_global_translation', prev_global),
+            ('prev_local_translation',  prev_local),
+            ('new_local_translation',   new_local)
         ]:
-            if not isinstance(translation_data, list) or len(translation_data) != 3:
-                return jsonify({
-                    'error': f'{name} must be a list of 3 numbers [x, y, z]'
-                }), 400
-            
-            try:
-                [float(x) for x in translation_data]
-            except (ValueError, TypeError):
-                return jsonify({
-                    'error': f'{name} must contain valid numbers'
-                }), 400
-        
-        # Calculate global translation
-        result = processor.calculate_global_translation(
-            prev_global_translation,
-            prev_local_translation,
-            new_local_translation,
-            session_id
-        )
-        
-        # Prepare response
-        response_data = {
+            if not isinstance(arr, list) or len(arr) != 3:
+                return jsonify({'error': f'{name} must be a list of 3 numbers'}), 400
+
+        if not session_id:
+            return jsonify({'error': 'session_id not provided'}), 400
+
+        # --- Load scale & rotation matrix ---
+        results_dir   = CONFIG['results_dir']
+        scale_path    = os.path.join(results_dir, f"{session_id}_scale.txt")
+        rotation_path = os.path.join(results_dir, f"{session_id}_rotation.txt")
+
+        if not os.path.isfile(scale_path) or not os.path.isfile(rotation_path):
+            return jsonify({
+                'error': 'Transformation files not found',
+                'scale_path':    scale_path,
+                'rotation_path': rotation_path
+            }), 500
+
+        # Read scale
+        with open(scale_path, 'r') as f:
+            scale = float(f.read().strip())
+
+        # Read 3×3 rotation matrix
+        R_opt = np.loadtxt(rotation_path)  # shape (3,3)
+
+        # --- Compute new global position ---
+        pg = np.array(prev_global, dtype=float)
+        pl = np.array(prev_local,  dtype=float)
+        nl = np.array(new_local,   dtype=float)
+
+        local_delta  = nl - pl              # SLAM local motion
+        scaled_delta = local_delta * scale  # apply scale
+        global_delta = R_opt.dot(scaled_delta)  # apply rotation
+        new_global   = pg + global_delta    # propagate from prev_global
+
+        # --- Return result ---
+        return jsonify({
             'success': True,
-            'vehicle_global_position': result['new_global_translation'],
-            'transformation_details': result['transformation_details'],
-            'input_data': result['input_data'],
-            'session_id': session_id,
+            'vehicle_global_position': {
+                'x': float(new_global[0]),
+                'y': float(new_global[1]),
+                'z': float(new_global[2])
+            },
             'timestamp': datetime.now().isoformat()
-        }
-        
-        return jsonify(response_data)
-        
+        })
+
     except Exception as e:
         return jsonify({
-            'error': str(e),
             'success': False,
+            'error': str(e),
             'timestamp': datetime.now().isoformat()
         }), 500
     

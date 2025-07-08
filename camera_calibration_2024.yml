@@ -20,7 +20,6 @@ Camera1.k3: 0.0
 Camera1.p1: 0.0
 Camera1.p2: 0.0
 
-
 # Image Resolution
 Camera.width: 1920
 Camera.height: 1080
@@ -49,9 +48,3 @@ Viewer.ViewpointX: 0.0
 Viewer.ViewpointY: 0.0
 Viewer.ViewpointZ: 0.0
 Viewer.ViewpointF: 0.0
-
-# Camera.newHeight: 1920
-# Camera.newWidth: 1080
-# System.LoadAtlasFromFile: "test"
-# System.SaveAtlasToFile: "test"
-# System.thFarPoints: 0.0
